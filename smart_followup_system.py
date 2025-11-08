@@ -5,14 +5,16 @@ from typing import Dict, Optional, List
 import uuid
 import random
 import time
+import re
 
-app = FastAPI(title="Smart Interview System", version="1.0.0")
+app = FastAPI(title="Professional Interview System", version="2.0.0")
 
 try:
     generator = pipeline("text2text-generation", model="google/flan-t5-small")
 except Exception as e:
     print(f"Model loading failed: {e}")
     generator = None
+
 interview_sessions = {}
 
 class InterviewRequest(BaseModel):
@@ -20,17 +22,94 @@ class InterviewRequest(BaseModel):
     round_type: str
     user_answer: Optional[str] = None
     duration_minutes: Optional[int] = 45
+    resume_text: Optional[str] = None
+
+def extract_resume_info(resume_text: str) -> Dict:
+    if not resume_text:
+        return {}
+    
+    text = resume_text.lower()
+    
+    skills = []
+    skill_patterns = [
+        r'python|java|javascript|react|node|angular|vue|django|flask|spring',
+        r'aws|azure|gcp|docker|kubernetes|jenkins|git|mongodb|mysql|postgresql',
+        r'machine learning|ai|data science|tensorflow|pytorch|pandas|numpy'
+    ]
+    
+    for pattern in skill_patterns:
+        matches = re.findall(pattern, text)
+        skills.extend(matches)
+    
+    projects = []
+    project_indicators = ['project', 'built', 'developed', 'created', 'implemented']
+    lines = resume_text.split('\n')
+    
+    for line in lines:
+        if any(indicator in line.lower() for indicator in project_indicators):
+            if len(line.strip()) > 20:
+                projects.append(line.strip())
+    
+    experience_years = 0
+    exp_match = re.search(r'(\d+)\s*(?:years?|yrs?)', text)
+    if exp_match:
+        experience_years = int(exp_match.group(1))
+    
+    return {
+        "skills": list(set(skills)),
+        "projects": projects[:3],
+        "experience_years": experience_years,
+        "has_leadership": any(word in text for word in ['lead', 'manager', 'senior', 'architect']),
+        "education": 'degree' in text or 'university' in text or 'college' in text
+    }
+
+def generate_resume_questions(resume_info: Dict, round_type: str) -> List[str]:
+    questions = []
+    
+    if not resume_info:
+        return questions
+    
+    if round_type == 'technical' and resume_info.get('projects'):
+        for project in resume_info['projects'][:2]:
+            questions.append(f"I see you worked on: '{project[:100]}...'. Can you walk me through the technical architecture and challenges you faced?")
+            questions.append(f"What technologies did you use in this project and why did you choose them?")
+        
+        if resume_info.get('skills'):
+            skills_str = ', '.join(resume_info['skills'][:5])
+            questions.append(f"I notice you have experience with {skills_str}. Which of these do you consider your strongest skill and why?")
+            questions.append(f"How do you stay updated with the latest developments in {resume_info['skills'][0] if resume_info['skills'] else 'technology'}?")
+    
+    elif round_type == 'hr' and resume_info.get('experience_years', 0) > 0:
+        questions.append(f"With {resume_info['experience_years']} years of experience, what would you say has been your biggest professional growth area?")
+        questions.append(f"Looking at your background, why are you interested in this particular role and company?")
+        questions.append(f"Based on your experience, where do you see yourself in the next 3-5 years?")
+        
+        if resume_info.get('has_leadership'):
+            questions.append("I see you have leadership experience. What leadership style do you prefer and why?")
+    
+    elif round_type == 'behavioral':
+        if resume_info.get('projects'):
+            for project in resume_info['projects'][:1]:
+                questions.append(f"Tell me about a specific challenge you encountered while working on: '{project[:80]}...' and how you overcame it.")
+        
+        if resume_info.get('experience_years', 0) > 2:
+            questions.append(f"In your {resume_info['experience_years']} years of experience, describe a time when you had to mentor or help a junior colleague.")
+        
+        if resume_info.get('has_leadership'):
+            questions.append("I see you have leadership experience. Tell me about a time when you had to make a difficult decision that affected your team.")
+            questions.append("Describe a situation where you had to manage conflicting priorities or team disagreements.")
+        
+        questions.append("Tell me about a time when you had to learn a new technology or skill quickly for a project.")
+    
+    return questions[:5]
 
 def analyze_candidate_data(session_data: Dict) -> Dict:
-    """Analyze collected interview data for insights"""
     conversation = session_data.get("conversation", [])
     total_score = session_data.get("total_score", 0)
     question_count = session_data.get("question_count", 1)
     
-    # Calculate metrics
     avg_score = total_score / question_count
     
-    # Analyze response patterns
     response_lengths = []
     technical_depth = 0
     communication_quality = 0
@@ -40,17 +119,14 @@ def analyze_candidate_data(session_data: Dict) -> Dict:
             answer = qa["user_answer"]
             response_lengths.append(len(answer.split()))
             
-            # Technical depth analysis
             tech_indicators = ["algorithm", "architecture", "design", "performance", "scalability", "database", "api"]
             technical_depth += sum(1 for word in tech_indicators if word.lower() in answer.lower())
             
-            # Communication quality
             if len(answer.split()) > 50:
                 communication_quality += 1
     
     avg_response_length = sum(response_lengths) / len(response_lengths) if response_lengths else 0
     
-    # Personality insights
     personality_traits = {
         "analytical_thinking": technical_depth > 5,
         "detailed_communicator": avg_response_length > 60,
@@ -59,7 +135,6 @@ def analyze_candidate_data(session_data: Dict) -> Dict:
         "growth_oriented": "learn" in str(conversation).lower() or "improve" in str(conversation).lower()
     }
     
-    # Skills assessment
     skills_mentioned = []
     skill_keywords = {
         "programming": ["python", "java", "javascript", "react", "node", "angular"],
@@ -139,12 +214,7 @@ def get_next_question(session_data: Dict, round_type: str) -> str:
             "How do you ensure code quality in your projects?",
             "What are the principles of SOLID design patterns?",
             "Explain microservices architecture and its trade-offs.",
-            "How do you handle version control and code reviews?",
-            "What is your approach to testing (unit, integration, e2e)?",
-            "Describe your experience with cloud platforms (AWS, Azure, GCP).",
-            "How do you stay updated with new technologies and trends?",
-            "What are the differences between SQL and NoSQL databases?",
-            "Explain load balancing and scaling strategies."
+            "How do you handle version control and code reviews?"
         ],
         "hr": [
             "Tell me about yourself and your professional journey.",
@@ -156,12 +226,7 @@ def get_next_question(session_data: Dict, round_type: str) -> str:
             "Describe your ideal work environment and team culture.",
             "What areas are you looking to improve or develop further?",
             "Why are you considering leaving your current position?",
-            "How do you approach learning new skills and technologies?",
-            "What has been your most significant professional achievement?",
-            "How do you prioritize tasks when managing multiple projects?",
-            "Describe a time when you had to adapt to major changes at work.",
-            "What type of management style works best for you?",
-            "How do you handle constructive feedback and criticism?"
+            "How do you approach learning new skills and technologies?"
         ],
         "behavioral": [
             "Tell me about a time you faced a significant technical challenge.",
@@ -173,12 +238,7 @@ def get_next_question(session_data: Dict, round_type: str) -> str:
             "Describe when you had to convince others to adopt your solution.",
             "Give an example of going above and beyond your job requirements.",
             "Tell me about handling ambiguous or changing requirements.",
-            "Describe working effectively with limited resources or budget.",
-            "Tell me about receiving and acting on constructive criticism.",
-            "Give an example of managing multiple competing priorities.",
-            "Describe collaborating with cross-functional teams successfully.",
-            "Tell me about a project you're most proud of and why.",
-            "Describe a time when you took initiative without being asked."
+            "Describe working effectively with limited resources or budget."
         ],
         "system_design": [
             "Design a URL shortener service like bit.ly with high availability.",
@@ -189,35 +249,45 @@ def get_next_question(session_data: Dict, round_type: str) -> str:
             "Design a ride-sharing service like Uber with real-time matching.",
             "Design a food delivery system like DoorDash with order tracking.",
             "Design a distributed cache system like Redis for high performance.",
-            "Design a search engine like Google with web crawling and indexing.",
-            "Design a content delivery network (CDN) for global content distribution.",
-            "Design a notification system for mobile and web applications.",
-            "Design a distributed file storage system like Dropbox or Google Drive.",
-            "Design a real-time collaborative editor like Google Docs.",
-            "Design a payment processing system with fraud detection.",
-            "Design a hotel booking system with inventory management."
+            "Design a search engine with web crawling and indexing.",
+            "Design a content delivery network for global distribution."
         ]
     }
     
     asked_questions = [qa.get("question", "") for qa in session_data.get("conversation", [])]
-    available = [q for q in question_banks.get(round_type, []) if q not in asked_questions]
     
-    if not available:
+    resume_questions = session_data.get("resume_questions", [])
+    available_resume = [q for q in resume_questions if q not in asked_questions]
+    
+    if available_resume:
+        return random.choice(available_resume)
+    
+    available_standard = [q for q in question_banks.get(round_type, []) if q not in asked_questions]
+    
+    if not available_standard:
         return "END_INTERVIEW"
     
-    return random.choice(available)
+    return random.choice(available_standard)
 
 @app.post("/interview/")
-async def smart_interview(request: InterviewRequest):
+async def conduct_interview(request: InterviewRequest):
     if not request.session_id:
         session_id = str(uuid.uuid4())
+        
+        resume_questions = []
+        if request.resume_text:
+            resume_info = extract_resume_info(request.resume_text)
+            resume_questions = generate_resume_questions(resume_info, request.round_type)
+        
         interview_sessions[session_id] = {
             "round_type": request.round_type,
             "conversation": [],
             "total_score": 0,
             "question_count": 0,
             "start_time": time.time(),
-            "duration_minutes": request.duration_minutes
+            "duration_minutes": request.duration_minutes,
+            "resume_text": request.resume_text,
+            "resume_questions": resume_questions
         }
     else:
         session_id = request.session_id
@@ -240,7 +310,6 @@ async def smart_interview(request: InterviewRequest):
         
         elapsed = time.time() - session_data["start_time"]
         if elapsed >= (session_data.get("duration_minutes", 45) * 60):
-            # Generate comprehensive analysis
             candidate_analysis = analyze_candidate_data(session_data)
             avg_score = session_data["total_score"] / session_data["question_count"]
             
@@ -312,17 +381,21 @@ async def smart_interview(request: InterviewRequest):
         first_question = get_next_question(session_data, request.round_type)
         session_data["conversation"].append({"question": first_question})
         
+        resume_info = ""
+        if request.resume_text:
+            resume_info = f" I've analyzed your resume and will ask personalized questions about your experience."
+        
         return {
             "session_id": session_id,
             "question": first_question,
             "round_type": request.round_type,
             "duration_minutes": request.duration_minutes,
-            "message": f"Welcome to {request.round_type} interview round. Duration: {request.duration_minutes} minutes. Let's begin!"
+            "resume_questions_generated": len(session_data.get("resume_questions", [])),
+            "message": f"Welcome to {request.round_type} interview round. Duration: {request.duration_minutes} minutes.{resume_info} Let's begin!"
         }
 
 @app.get("/analytics/{session_id}")
 async def get_interview_analytics(session_id: str):
-    """Get detailed analytics for completed interview"""
     if session_id not in interview_sessions:
         return {"error": "Session not found"}
     
@@ -336,15 +409,17 @@ async def get_interview_analytics(session_id: str):
             "total_questions": session_data["question_count"],
             "conversation_length": len(session_data["conversation"]),
             "interview_duration": session_data.get("duration_minutes", 45),
-            "round_type": session_data["round_type"]
+            "round_type": session_data["round_type"],
+            "resume_questions_used": len(session_data.get("resume_questions", []))
         }
     }
 
 @app.get("/")
 def home():
     return {
-        "message": "Smart Interview System with Advanced Analytics",
+        "message": "Professional Interview System with Resume Analysis",
         "features": [
+            "Resume-based personalized questions",
             "Industry-standard interview experience (45 minutes)",
             "Comprehensive question banks for all interview types", 
             "Advanced candidate data analysis and insights",
@@ -352,20 +427,18 @@ def home():
             "Skills identification and personality profiling",
             "Hiring recommendation with confidence scoring"
         ],
-        "data_insights": [
-            "Performance metrics and scoring patterns",
-            "Communication style analysis (detailed/concise/balanced)",
-            "Technical competency assessment (basic/intermediate/advanced)",
-            "Personality traits identification (analytical, growth-oriented, etc.)",
-            "Skills and technology stack identification",
-            "Cultural fit and experience level evaluation"
-        ],
-        "final_flow": {
-            "1_start": "POST /interview/ with round_type and duration_minutes",
+        "usage_flow": {
+            "1_start": "POST /interview/ with round_type, duration_minutes, and optional resume_text",
             "2_continue": "POST /interview/ with session_id and user_answer (repeat until time expires)",
             "3_completion": "Automatic comprehensive analysis with candidate insights",
             "4_analytics": "GET /analytics/{session_id} for detailed data analysis"
-        }
+        },
+        "resume_features": [
+            "Automatic skill extraction from resume",
+            "Project-based technical questions",
+            "Experience-level appropriate questions",
+            "Leadership and responsibility focused queries"
+        ]
     }
 
 if __name__ == "__main__":
