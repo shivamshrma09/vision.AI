@@ -8,7 +8,11 @@ import time
 
 app = FastAPI(title="Smart Interview System", version="1.0.0")
 
-generator = pipeline("text2text-generation", model="google/flan-t5-small")
+try:
+    generator = pipeline("text2text-generation", model="google/flan-t5-small")
+except Exception as e:
+    print(f"Model loading failed: {e}")
+    generator = None
 interview_sessions = {}
 
 class InterviewRequest(BaseModel):
@@ -74,7 +78,7 @@ def analyze_candidate_data(session_data: Dict) -> Dict:
         "performance_metrics": {
             "average_score": round(avg_score, 1),
             "total_questions": question_count,
-            "response_consistency": "High" if max(response_lengths) - min(response_lengths) < 50 else "Medium",
+            "response_consistency": "High" if response_lengths and max(response_lengths) - min(response_lengths) < 50 else "Medium",
             "technical_depth_score": technical_depth,
             "communication_score": communication_quality
         },
@@ -255,8 +259,11 @@ async def smart_interview(request: InterviewRequest):
             """
             
             try:
-                completion_response = generator(completion_prompt, max_length=200, temperature=0.7)
-                professional_message = completion_response[0]['generated_text']
+                if generator:
+                    completion_response = generator(completion_prompt, max_length=200, temperature=0.7)
+                    professional_message = completion_response[0]['generated_text']
+                else:
+                    raise Exception("Generator not available")
             except:
                 professional_message = f"Interview completed successfully. Candidate demonstrated {candidate_analysis['candidate_insights']['experience_level'].lower()} level competency with {candidate_analysis['hiring_insights']['interview_performance'].lower()} performance. Recommendation: {candidate_analysis['hiring_insights']['technical_readiness']}."
             
