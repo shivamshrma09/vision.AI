@@ -1,16 +1,14 @@
 services:
   - type: web
-    name: interview-ai-assistant
+    name: interview-system
     env: python
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn interview_app:app --host 0.0.0.0 --port $PORT
+    startCommand: uvicorn smart_followup_system:app --host 0.0.0.0 --port $PORT
     plan: free
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
-      - key: HF_HOME
-        value: /tmp/huggingface
-    disk:
-      name: interview-ai-disk
-      mountPath: /tmp/huggingface
-      sizeGB: 2
+    
+  - type: web
+    name: coding-judge
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn coding_judge:app --host 0.0.0.0 --port $PORT
+    plan: free
