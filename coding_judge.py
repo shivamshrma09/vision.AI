@@ -1,224 +1,484 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import pipeline
-from typing import List, Dict
+from typing import List, Dict, Optional
 import ast
 import re
 import tempfile
 import subprocess
 import sys
 import json
+import time
+import traceback
+import asyncio
+import psutil
+import os
 
-app = FastAPI(title="Enhanced Simple Code Judge", version="2.0.0")
+app = FastAPI(title="Balanced Coding Judge", version="6.0.0")
 
-generator = pipeline("text2text-generation", model="google/flan-t5-small")
+generator = None
+
+def load_model():
+    global generator
+    if generator is None:
+        try:
+            generator = pipeline("text2text-generation", model="google/flan-t5-base")
+        except Exception as e:
+            print(f"Model loading failed: {e}")
+            generator = None
+    return generator
+
+load_model()
 
 class TestCase(BaseModel):
-    input_data: List
-    expected_output: any
+    input_data: str
+    expected_output: str
     description: str
+    time_limit: Optional[float] = 2.0
+    memory_limit: Optional[int] = 256
+    is_hidden: Optional[bool] = False
+    difficulty: Optional[str] = "medium"
 
 class CodeSubmission(BaseModel):
     code: str
     language: str
+    problem_id: str
     problem_statement: str
     test_cases: List[TestCase]
+    constraints: Optional[Dict] = {}
+    company: Optional[str] = "generic"
 
-def analyze_complexity_enhanced(code: str) -> Dict:
-    """Enhanced complexity analysis with recursion detection"""
-    try:
-        tree = ast.parse(code)
-        
-        class ComplexityAnalyzer(ast.NodeVisitor):
-            def __init__(self):
-                self.loop_depth = 0
-                self.max_depth = 0
-                self.has_recursion = False
-                self.function_name = None
-                self.recursive_calls = 0
-                
-            def visit_FunctionDef(self, node):
-                if not self.function_name:
-                    self.function_name = node.name
-                self.generic_visit(node)
-                
-            def visit_For(self, node):
-                self.loop_depth += 1
-                self.max_depth = max(self.max_depth, self.loop_depth)
-                self.generic_visit(node)
-                self.loop_depth -= 1
-                
-            def visit_While(self, node):
-                self.loop_depth += 1
-                self.max_depth = max(self.max_depth, self.loop_depth)
-                self.generic_visit(node)
-                self.loop_depth -= 1
-                
-            def visit_Call(self, node):
-                if (isinstance(node.func, ast.Name) and 
-                    node.func.id == self.function_name):
-                    self.has_recursion = True
-                    self.recursive_calls += 1
-                self.generic_visit(node)
-        
-        analyzer = ComplexityAnalyzer()
-        analyzer.visit(tree)
-        
-        if analyzer.has_recursion:
-            if "fibonacci" in code.lower() or analyzer.recursive_calls > 1:
-                complexity = "O(2^n)"
-                score = 40
-            else:
-                complexity = "O(n)"
-                score = 80
-        elif analyzer.max_depth >= 3:
-            complexity = "O(n³)"
-            score = 50
-        elif analyzer.max_depth >= 2:
-            complexity = "O(n²)"
-            score = 70
-        elif analyzer.max_depth == 1:
-            complexity = "O(n)"
-            score = 90
-        else:
-            complexity = "O(1)"
-            score = 100
-            
-        return {
-            "time_complexity": complexity,
-            "loop_depth": analyzer.max_depth,
-            "has_recursion": analyzer.has_recursion,
-            "recursive_calls": analyzer.recursive_calls,
-            "complexity_score": score,
-            "analysis": f"Detected {analyzer.max_depth} nested loops, recursion: {analyzer.has_recursion}"
+def get_language_config(language: str) -> Dict:
+    configs = {
+        "python": {
+            "extension": ".py",
+            "compile_cmd": None,
+            "run_cmd": [sys.executable],
+            "timeout": 10
+        },
+        "cpp": {
+            "extension": ".cpp",
+            "compile_cmd": ["g++", "-std=c++17", "-O2", "-o"],
+            "run_cmd": [],
+            "timeout": 15
+        },
+        "c": {
+            "extension": ".c",
+            "compile_cmd": ["gcc", "-std=c11", "-O2", "-o"],
+            "run_cmd": [],
+            "timeout": 15
+        },
+        "java": {
+            "extension": ".java",
+            "compile_cmd": ["javac"],
+            "run_cmd": ["java"],
+            "timeout": 15
+        },
+        "javascript": {
+            "extension": ".js",
+            "compile_cmd": None,
+            "run_cmd": ["node"],
+            "timeout": 10
         }
-        
-    except Exception as e:
-        return {
-            "time_complexity": "O(n)",
-            "complexity_score": 80,
-            "analysis": f"AST parsing failed: {str(e)}"
-        }
+    }
+    return configs.get(language, configs["python"])
 
-def analyze_style_enhanced(code: str) -> Dict:
-    """Enhanced style analysis"""
-    issues = []
-    good_practices = []
-    score = 100
+def analyze_code_structure(code: str, language: str) -> Dict:
+    lines = code.split('\n')
+    non_empty_lines = [line for line in lines if line.strip()]
     
+    structure_analysis = {
+        "total_lines": len(lines),
+        "code_lines": len(non_empty_lines),
+        "comment_lines": len([line for line in lines if line.strip().startswith('#' if language == 'python' else '//')]),
+        "blank_lines": len(lines) - len(non_empty_lines),
+        "functions_count": len(re.findall(r'def |function |int |void ', code)),
+        "variables_count": len(re.findall(r'[a-zA-Z_][a-zA-Z0-9_]*\s*=', code)),
+        "readability_score": calculate_readability_score(code, language)
+    }
+    
+    return structure_analysis
+
+def calculate_readability_score(code: str, language: str) -> int:
+    score = 100
     lines = code.split('\n')
     
-    if '"""' in code or "'''" in code:
-        good_practices.append("Function documentation present")
-    else:
-        issues.append("Missing function docstrings")
-        score -= 20
+    # Line length penalty
+    long_lines = [line for line in lines if len(line) > 80]
+    score -= min(len(long_lines) * 5, 20)
     
-    if re.search(r'\bdef [A-Z][a-zA-Z]*\(', code):
-        issues.append("Function names should use snake_case")
-        score -= 10
-    
-    if re.search(r'\b[A-Z][a-z]+[A-Z][a-zA-Z]*\b', code):
-        issues.append("Variable names should use snake_case")
-        score -= 10
-    
-    long_lines = [i+1 for i, line in enumerate(lines) if len(line) > 79]
-    if long_lines:
-        issues.append(f"Lines too long (>79 chars): lines {long_lines[:3]}")
-        score -= 5
-    
-    indentations = []
+    # Indentation consistency
+    indents = []
     for line in lines:
-        if line.strip() and line.startswith(' '):
+        if line.strip():
             indent = len(line) - len(line.lstrip())
             if indent > 0:
-                indentations.append(indent)
+                indents.append(indent)
     
-    if indentations and len(set(indentations)) > 2:
-        issues.append("Inconsistent indentation")
+    if indents and len(set(indents)) > 3:
+        score -= 10
+    
+    # Variable naming
+    if language == "python":
+        bad_names = re.findall(r'\b[a-z][A-Z]', code)  # camelCase in Python
+        score -= len(bad_names) * 3
+    
+    # Comments ratio
+    comment_ratio = len([l for l in lines if l.strip().startswith('#')]) / len(lines) * 100
+    if comment_ratio < 5:
+        score -= 10
+    elif comment_ratio > 30:
         score -= 5
     
-    if 'if __name__ == "__main__"' in code:
-        good_practices.append("Proper main guard")
+    return max(0, score)
+
+def analyze_algorithm_patterns(code: str, language: str) -> Dict:
+    patterns = {
+        "sorting": bool(re.search(r'sort|Sort', code)),
+        "searching": bool(re.search(r'binary_search|bsearch|find|search', code)),
+        "dynamic_programming": bool(re.search(r'dp|memo|cache|@lru_cache', code)),
+        "recursion": bool(re.search(r'def.*\(.*\).*:.*\1\(', code, re.DOTALL)) if language == "python" else False,
+        "greedy": bool(re.search(r'min|max|optimal|greedy', code)),
+        "graph_algorithms": bool(re.search(r'dfs|bfs|graph|tree|node', code)),
+        "data_structures": detect_data_structures(code, language),
+        "mathematical": bool(re.search(r'math|sqrt|pow|factorial|gcd', code))
+    }
     
-    if re.search(r'def \w+\([^)]*\) -> ', code):
-        good_practices.append("Type hints present")
-        score += 5
-    
-    comment_lines = [line for line in lines if '#' in line and line.strip().startswith('#')]
-    if comment_lines:
-        good_practices.append(f"Inline comments ({len(comment_lines)} lines)")
+    pattern_score = sum([10 for pattern, used in patterns.items() if used and pattern != "data_structures"])
+    pattern_score += len(patterns["data_structures"]) * 5
     
     return {
-        "style_score": max(0, min(100, score)),
-        "issues": issues,
-        "good_practices": good_practices,
-        "pep8_compliance": "High" if score > 85 else "Medium" if score > 70 else "Low",
-        "line_count": len(lines),
-        "comment_ratio": len(comment_lines) / len(lines) * 100 if lines else 0
+        "patterns_detected": patterns,
+        "pattern_diversity_score": min(pattern_score, 100),
+        "algorithm_sophistication": get_sophistication_level(patterns)
     }
 
-def analyze_security_enhanced(code: str) -> Dict:
-    """Enhanced security analysis"""
-    security_issues = []
-    score = 100
-    risk_factors = []
+def detect_data_structures(code: str, language: str) -> List[str]:
+    structures = []
     
-    dangerous_patterns = [
-        (r'eval\s*\(', "Use of eval() is dangerous - can execute arbitrary code", 30),
-        (r'exec\s*\(', "Use of exec() is dangerous - can execute arbitrary code", 30),
-        (r'__import__\s*\(', "Dynamic imports can be risky", 15),
-        (r'os\.system\s*\(', "System command execution detected", 25),
-        (r'subprocess\.call\s*\(', "Subprocess usage - ensure input validation", 15),
-        (r'pickle\.loads?\s*\(', "Pickle deserialization can be unsafe", 20),
-        (r'input\s*\([^)]*\)', "Raw input usage - validate user input", 10)
-    ]
+    if language == "python":
+        if re.search(r'set\(|{.*}', code): structures.append("set")
+        if re.search(r'dict\(|{.*:.*}', code): structures.append("dictionary")
+        if re.search(r'list\(|\[.*\]', code): structures.append("list")
+        if re.search(r'deque|queue', code): structures.append("queue")
+        if re.search(r'heapq|heap', code): structures.append("heap")
+    elif language in ["cpp", "c"]:
+        if re.search(r'vector|array', code): structures.append("array")
+        if re.search(r'map|unordered_map', code): structures.append("hash_map")
+        if re.search(r'set|unordered_set', code): structures.append("set")
+        if re.search(r'queue|stack', code): structures.append("queue")
+    elif language == "java":
+        if re.search(r'ArrayList|List', code): structures.append("list")
+        if re.search(r'HashMap|Map', code): structures.append("hash_map")
+        if re.search(r'HashSet|Set', code): structures.append("set")
+        if re.search(r'Queue|Stack', code): structures.append("queue")
     
-    for pattern, message, penalty in dangerous_patterns:
-        if re.search(pattern, code):
-            security_issues.append(message)
-            risk_factors.append(pattern)
-            score -= penalty
+    return structures
+
+def get_sophistication_level(patterns: Dict) -> str:
+    advanced_patterns = ["dynamic_programming", "graph_algorithms", "mathematical"]
+    intermediate_patterns = ["sorting", "searching", "recursion"]
     
-    sql_patterns = [
-        r'["\'].*%.*["\'].*%',
-        r'["\'].*\+.*["\']',
-        r'f["\'].*{.*}.*["\']'
-    ]
+    if any(patterns[p] for p in advanced_patterns):
+        return "Advanced"
+    elif any(patterns[p] for p in intermediate_patterns):
+        return "Intermediate"
+    else:
+        return "Basic"
+
+def analyze_performance_characteristics(code: str, language: str) -> Dict:
+    # Time complexity analysis
+    loop_count = len(re.findall(r'for|while', code))
+    nested_loops = 0
     
-    for pattern in sql_patterns:
-        if re.search(pattern, code):
-            security_issues.append("Potential SQL injection vulnerability")
-            score -= 25
-            break
+    if language == "python":
+        nested_loops = len(re.findall(r'for.*:.*for.*:', code, re.DOTALL))
+    elif language in ["cpp", "c", "java"]:
+        nested_loops = len(re.findall(r'for\s*\([^)]*\)\s*{[^}]*for\s*\([^)]*\)', code, re.DOTALL))
     
-    if re.search(r'(password|secret|key|token)\s*=\s*["\'][^"\']+["\']', code, re.IGNORECASE):
-        security_issues.append("Hardcoded credentials detected")
-        score -= 20
+    # Space complexity indicators
+    space_indicators = {
+        "extra_arrays": len(re.findall(r'new\s+\w+\[|malloc|vector<|list<|ArrayList', code)),
+        "recursive_calls": bool(re.search(r'return.*\w+\(', code)),
+        "memoization": bool(re.search(r'memo|cache|dp\[', code))
+    }
+    
+    # Estimate complexity
+    if nested_loops >= 3:
+        time_complexity = "O(n³)"
+        efficiency_score = 40
+    elif nested_loops >= 2:
+        time_complexity = "O(n²)"
+        efficiency_score = 60
+    elif nested_loops >= 1 or loop_count >= 1:
+        time_complexity = "O(n)"
+        efficiency_score = 80
+    else:
+        time_complexity = "O(1)"
+        efficiency_score = 100
+    
+    # Adjust for optimizations
+    if space_indicators["memoization"]:
+        efficiency_score += 10
+    if space_indicators["extra_arrays"] > 2:
+        efficiency_score -= 10
     
     return {
-        "security_score": max(0, score),
-        "security_issues": security_issues,
-        "risk_factors": risk_factors,
-        "risk_level": "Low" if score > 80 else "Medium" if score > 60 else "High"
+        "estimated_time_complexity": time_complexity,
+        "estimated_space_complexity": "O(n)" if space_indicators["extra_arrays"] > 0 or space_indicators["recursive_calls"] else "O(1)",
+        "efficiency_score": max(0, min(100, efficiency_score)),
+        "optimization_opportunities": get_optimization_suggestions(code, language),
+        "performance_bottlenecks": identify_bottlenecks(code, language)
     }
 
-def execute_code_safely(code: str, test_cases: List[TestCase]) -> Dict:
-    """Safely execute code with test cases"""
+def get_optimization_suggestions(code: str, language: str) -> List[str]:
+    suggestions = []
+    
+    if re.search(r'range\(len\(', code):
+        suggestions.append("Use enumerate() instead of range(len())")
+    
+    if re.search(r'for.*in.*if', code) and language == "python":
+        suggestions.append("Consider using list comprehension")
+    
+    if re.search(r'\.append\(.*\)', code) and "list" in code:
+        suggestions.append("Pre-allocate list size if known")
+    
+    if not re.search(r'memo|cache|dp', code) and re.search(r'def.*\(.*\).*:.*return.*\1\(', code, re.DOTALL):
+        suggestions.append("Add memoization to recursive functions")
+    
+    return suggestions
+
+def identify_bottlenecks(code: str, language: str) -> List[str]:
+    bottlenecks = []
+    
+    if len(re.findall(r'for.*for.*for', code)) > 0:
+        bottlenecks.append("Triple nested loops detected")
+    
+    if re.search(r'\.sort\(\).*for.*in', code):
+        bottlenecks.append("Sorting inside loop")
+    
+    if re.search(r'print\(|console\.log\(|cout\s*<<', code):
+        bottlenecks.append("I/O operations in main logic")
+    
+    return bottlenecks
+
+def calculate_code_quality_metrics(code: str, language: str) -> Dict:
+    structure = analyze_code_structure(code, language)
+    patterns = analyze_algorithm_patterns(code, language)
+    performance = analyze_performance_characteristics(code, language)
+    
+    # Overall quality score
+    quality_components = {
+        "readability": structure["readability_score"] * 0.25,
+        "algorithm_design": patterns["pattern_diversity_score"] * 0.35,
+        "performance": performance["efficiency_score"] * 0.40
+    }
+    
+    overall_quality = sum(quality_components.values())
+    
+    return {
+        "overall_quality_score": round(overall_quality, 1),
+        "quality_breakdown": quality_components,
+        "code_maturity": get_code_maturity_level(overall_quality),
+        "improvement_priority": get_improvement_priority(quality_components),
+        "industry_readiness": assess_industry_readiness(overall_quality, patterns["algorithm_sophistication"])
+    }
+
+def get_code_maturity_level(score: float) -> str:
+    if score >= 85:
+        return "Production Ready"
+    elif score >= 70:
+        return "Good Quality"
+    elif score >= 55:
+        return "Acceptable"
+    else:
+        return "Needs Improvement"
+
+def get_improvement_priority(components: Dict) -> str:
+    min_component = min(components, key=components.get)
+    return f"Focus on {min_component.replace('_', ' ').title()}"
+
+def assess_industry_readiness(score: float, sophistication: str) -> Dict:
+    readiness = {
+        "junior_developer": score >= 50,
+        "mid_level_developer": score >= 70 and sophistication in ["Intermediate", "Advanced"],
+        "senior_developer": score >= 85 and sophistication == "Advanced",
+        "tech_lead_ready": score >= 90 and sophistication == "Advanced"
+    }
+    
+    current_level = "Entry Level"
+    if readiness["tech_lead_ready"]:
+        current_level = "Tech Lead Ready"
+    elif readiness["senior_developer"]:
+        current_level = "Senior Developer"
+    elif readiness["mid_level_developer"]:
+        current_level = "Mid-Level Developer"
+    elif readiness["junior_developer"]:
+        current_level = "Junior Developer"
+    
+    return {
+        "current_level": current_level,
+        "readiness_breakdown": readiness,
+        "next_milestone": get_next_milestone(current_level)
+    }
+
+def get_next_milestone(current_level: str) -> str:
+    milestones = {
+        "Entry Level": "Focus on algorithm fundamentals and code structure",
+        "Junior Developer": "Learn advanced data structures and design patterns",
+        "Mid-Level Developer": "Master system design and optimization techniques",
+        "Senior Developer": "Develop architectural thinking and mentoring skills",
+        "Tech Lead Ready": "Continue excellence and explore new technologies"
+    }
+    return milestones.get(current_level, "Keep improving!")
+
+async def execute_multi_language_tests(code: str, language: str, test_cases: List[TestCase]) -> Dict:
+    config = get_language_config(language)
     results = []
+    total_score = 0
+    execution_times = []
     
     for i, test_case in enumerate(test_cases):
         try:
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-                test_code = f"""
+            with tempfile.NamedTemporaryFile(mode='w', suffix=config["extension"], delete=False) as f:
+                if language == "python":
+                    test_code = create_python_test(code, test_case)
+                elif language in ["cpp", "c"]:
+                    test_code = create_cpp_test(code, test_case, language)
+                elif language == "java":
+                    test_code = create_java_test(code, test_case)
+                elif language == "javascript":
+                    test_code = create_js_test(code, test_case)
+                
+                f.write(test_code)
+                f.flush()
+                
+                try:
+                    # Compile if needed
+                    if config["compile_cmd"]:
+                        if language == "java":
+                            compile_result = subprocess.run(
+                                config["compile_cmd"] + [f.name],
+                                capture_output=True, text=True, timeout=10
+                            )
+                        else:
+                            executable = f.name.replace(config["extension"], "")
+                            compile_result = subprocess.run(
+                                config["compile_cmd"] + [executable, f.name],
+                                capture_output=True, text=True, timeout=10
+                            )
+                        
+                        if compile_result.returncode != 0:
+                            results.append({
+                                "test_case": i + 1,
+                                "passed": False,
+                                "error": f"Compilation Error: {compile_result.stderr}",
+                                "verdict": "COMPILATION_ERROR"
+                            })
+                            continue
+                    
+                    # Execute
+                    if language == "java":
+                        class_name = extract_java_class_name(code)
+                        run_cmd = config["run_cmd"] + [class_name]
+                        cwd = os.path.dirname(f.name)
+                    elif config["compile_cmd"] and language in ["cpp", "c"]:
+                        executable = f.name.replace(config["extension"], "")
+                        run_cmd = [executable]
+                        cwd = None
+                    else:
+                        run_cmd = config["run_cmd"] + [f.name]
+                        cwd = None
+                    
+                    start_time = time.time()
+                    result = subprocess.run(
+                        run_cmd,
+                        input=test_case.input_data,
+                        capture_output=True,
+                        text=True,
+                        timeout=test_case.time_limit,
+                        cwd=cwd
+                    )
+                    end_time = time.time()
+                    
+                    execution_time = end_time - start_time
+                    execution_times.append(execution_time)
+                    output = result.stdout.strip()
+                    expected = test_case.expected_output.strip()
+                    
+                    passed = output == expected
+                    if passed:
+                        total_score += 1
+                    
+                    results.append({
+                        "test_case": i + 1,
+                        "description": test_case.description,
+                        "passed": passed,
+                        "output": output,
+                        "expected": expected,
+                        "execution_time": execution_time,
+                        "performance_rating": "Fast" if execution_time < 0.1 else "Average" if execution_time < 1.0 else "Slow",
+                        "verdict": "ACCEPTED" if passed else "WRONG_ANSWER"
+                    })
+                    
+                except subprocess.TimeoutExpired:
+                    results.append({
+                        "test_case": i + 1,
+                        "passed": False,
+                        "error": f"Time Limit Exceeded (>{test_case.time_limit}s)",
+                        "verdict": "TIME_LIMIT_EXCEEDED"
+                    })
+                except Exception as e:
+                    results.append({
+                        "test_case": i + 1,
+                        "passed": False,
+                        "error": f"Runtime Error: {str(e)}",
+                        "verdict": "RUNTIME_ERROR"
+                    })
+                finally:
+                    try:
+                        os.unlink(f.name)
+                        if config["compile_cmd"] and language in ["cpp", "c"]:
+                            executable = f.name.replace(config["extension"], "")
+                            if os.path.exists(executable):
+                                os.unlink(executable)
+                    except:
+                        pass
+                        
+        except Exception as e:
+            results.append({
+                "test_case": i + 1,
+                "passed": False,
+                "error": f"Setup Error: {str(e)}",
+                "verdict": "COMPILATION_ERROR"
+            })
+    
+    total_tests = len(results)
+    correctness_score = (total_score / total_tests * 100) if total_tests > 0 else 0
+    
+    return {
+        "correctness_score": correctness_score,
+        "passed_tests": total_score,
+        "total_tests": total_tests,
+        "test_results": results,
+        "performance_summary": {
+            "avg_execution_time": sum(execution_times) / len(execution_times) if execution_times else 0,
+            "fastest_test": min(execution_times) if execution_times else 0,
+            "slowest_test": max(execution_times) if execution_times else 0,
+            "performance_consistency": "High" if execution_times and max(execution_times) - min(execution_times) < 0.5 else "Medium"
+        },
+        "final_verdict": "ACCEPTED" if correctness_score == 100 else "PARTIAL" if correctness_score >= 50 else "FAILED"
+    }
+
+def create_python_test(code: str, test_case: TestCase) -> str:
+    return f"""
 import sys
-import json
-import time
+from typing import *
 
 {code}
 
 try:
-    start_time = time.time()
+    input_data = {repr(test_case.input_data)}
     
     import ast
     tree = ast.parse('''{code}''')
@@ -229,230 +489,205 @@ try:
             break
     
     if func_name:
-        result = globals()[func_name](*{test_case.input_data})
-        end_time = time.time()
-        
-        print(json.dumps({{
-            "success": True,
-            "result": result,
-            "expected": {test_case.expected_output},
-            "passed": result == {test_case.expected_output},
-            "execution_time": end_time - start_time
-        }}))
-    else:
-        print(json.dumps({{
-            "success": False,
-            "error": "No function found"
-        }}))
-        
-except Exception as e:
-    print(json.dumps({{
-        "success": False,
-        "error": str(e)
-    }}))
-"""
-                f.write(test_code)
-                f.flush()
-                
+        lines = input_data.strip().split('\\n')
+        if len(lines) == 1:
+            try:
+                result = globals()[func_name](int(lines[0]))
+            except:
+                result = globals()[func_name](lines[0])
+        else:
+            args = []
+            for line in lines:
                 try:
-                    result = subprocess.run(
-                        [sys.executable, f.name],
-                        capture_output=True,
-                        text=True,
-                        timeout=5
-                    )
-                    
-                    if result.stdout:
-                        exec_result = json.loads(result.stdout.strip())
-                        results.append({
-                            "test_case": i + 1,
-                            "description": test_case.description,
-                            "passed": exec_result.get("passed", False),
-                            "output": exec_result.get("result"),
-                            "expected": test_case.expected_output,
-                            "execution_time": exec_result.get("execution_time", 0),
-                            "error": exec_result.get("error")
-                        })
+                    if ' ' in line:
+                        args.append(list(map(int, line.split())))
                     else:
-                        results.append({
-                            "test_case": i + 1,
-                            "description": test_case.description,
-                            "passed": False,
-                            "error": result.stderr or "No output"
-                        })
-                        
-                except subprocess.TimeoutExpired:
-                    results.append({
-                        "test_case": i + 1,
-                        "description": test_case.description,
-                        "passed": False,
-                        "error": "Execution timeout (>5s)"
-                    })
-                except Exception as e:
-                    results.append({
-                        "test_case": i + 1,
-                        "description": test_case.description,
-                        "passed": False,
-                        "error": f"Execution error: {str(e)}"
-                    })
-                finally:
-                    try:
-                        import os
-                        os.unlink(f.name)
-                    except:
-                        pass
-                        
-        except Exception as e:
-            results.append({
-                "test_case": i + 1,
-                "description": test_case.description,
-                "passed": False,
-                "error": f"Setup error: {str(e)}"
-            })
+                        args.append(int(line))
+                except:
+                    args.append(line)
+            result = globals()[func_name](*args)
+        
+        print(result)
     
-    passed_tests = sum(1 for r in results if r.get("passed", False))
-    total_tests = len(results)
-    correctness_score = (passed_tests / total_tests * 100) if total_tests > 0 else 0
-    
-    return {
-        "correctness_score": correctness_score,
-        "passed_tests": passed_tests,
-        "total_tests": total_tests,
-        "test_results": results
-    }
+except Exception as e:
+    print(f"Error: {{e}}")
+"""
 
-@app.post("/judge-code/")
-async def judge_code_enhanced(submission: CodeSubmission):
-    """Enhanced async code judge with execution"""
-    
-    complexity = analyze_complexity_enhanced(submission.code)
-    style = analyze_style_enhanced(submission.code)
-    security = analyze_security_enhanced(submission.code)
-    execution = execute_code_safely(submission.code, submission.test_cases)
-    
-    overall_score = int((
-        execution["correctness_score"] * 0.4 +
-        complexity["complexity_score"] * 0.25 +
-        style["style_score"] * 0.2 +
-        security["security_score"] * 0.15
-    ))
-    
-    if overall_score >= 95:
-        grade = "A+"
-    elif overall_score >= 90:
-        grade = "A"
-    elif overall_score >= 80:
-        grade = "B+"
-    elif overall_score >= 70:
-        grade = "B"
-    elif overall_score >= 60:
-        grade = "C"
-    else:
-        grade = "D"
-    
-    feedback_prompt = f"""
-    Code Analysis for: {submission.problem_statement}
-    
-    Results:
-    - Correctness: {execution['correctness_score']:.1f}% ({execution['passed_tests']}/{execution['total_tests']} tests passed)
-    - Complexity: {complexity['time_complexity']} (Score: {complexity['complexity_score']}/100)
-    - Style: {style['pep8_compliance']} compliance (Score: {style['style_score']}/100)
-    - Security: {security['risk_level']} risk (Score: {security['security_score']}/100)
-    
-    Provide specific, actionable feedback for improvement.
-    """
-    
+def create_cpp_test(code: str, test_case: TestCase, language: str) -> str:
+    return f"""
+#include <iostream>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <map>
+#include <set>
+#include <queue>
+#include <stack>
+using namespace std;
+
+{code}
+
+int main() {{
+    return 0;
+}}
+"""
+
+def create_java_test(code: str, test_case: TestCase) -> str:
+    return f"""
+import java.util.*;
+import java.io.*;
+
+{code}
+"""
+
+def create_js_test(code: str, test_case: TestCase) -> str:
+    return f"""
+{code}
+
+const input = `{test_case.input_data}`;
+const lines = input.trim().split('\\n');
+
+try {{
+    let result;
+    if (lines.length === 1) {{
+        const arg = isNaN(lines[0]) ? lines[0] : parseInt(lines[0]);
+        const funcMatch = `{code}`.match(/function\\s+(\\w+)/);
+        if (funcMatch) {{
+            result = eval(funcMatch[1] + '(' + JSON.stringify(arg) + ')');
+        }}
+    }}
+    console.log(result);
+}} catch (e) {{
+    console.log('Error:', e.message);
+}}
+"""
+
+def extract_java_class_name(code: str) -> str:
+    match = re.search(r'public\s+class\s+(\w+)', code)
+    return match.group(1) if match else "Solution"
+
+@app.post("/judge-balanced/")
+async def judge_balanced_code(submission: CodeSubmission):
     try:
-        ai_feedback = generator(feedback_prompt, max_length=200, do_sample=True, temperature=0.7)
-        feedback_text = ai_feedback[0]['generated_text']
-    except Exception as e:
-        feedback_text = f"AI feedback unavailable: {str(e)}"
-    
-    return {
-        "overall_score": overall_score,
-        "grade": grade,
-        "pass_status": "PASS" if overall_score >= 70 else "FAIL",
+        supported_languages = ["python", "cpp", "c", "java", "javascript"]
+        if submission.language not in supported_languages:
+            raise HTTPException(status_code=400, detail=f"Language {submission.language} not supported")
         
-        "execution_results": {
-            "correctness_score": execution["correctness_score"],
-            "passed_tests": execution["passed_tests"],
-            "total_tests": execution["total_tests"],
-            "test_details": execution["test_results"]
-        },
+        # Comprehensive analysis
+        quality_metrics = calculate_code_quality_metrics(submission.code, submission.language)
+        execution_results = await execute_multi_language_tests(submission.code, submission.language, submission.test_cases)
         
-        "complexity_analysis": {
-            "time_complexity": complexity["time_complexity"],
-            "complexity_score": complexity["complexity_score"],
-            "loop_depth": complexity["loop_depth"],
-            "has_recursion": complexity["has_recursion"],
-            "analysis": complexity["analysis"]
-        },
+        # Calculate balanced score
+        overall_score = int(
+            execution_results["correctness_score"] * 0.50 +
+            quality_metrics["overall_quality_score"] * 0.50
+        )
         
-        "style_analysis": {
-            "style_score": style["style_score"],
-            "pep8_compliance": style["pep8_compliance"],
-            "issues": style["issues"],
-            "good_practices": style["good_practices"],
-            "line_count": style["line_count"],
-            "comment_ratio": f"{style['comment_ratio']:.1f}%"
-        },
+        # Balanced grading system
+        if overall_score >= 85:
+            grade = "EXCELLENT"
+            level = "Senior Ready"
+        elif overall_score >= 75:
+            grade = "GOOD"
+            level = "Mid-Level Ready"
+        elif overall_score >= 65:
+            grade = "SATISFACTORY"
+            level = "Junior+ Ready"
+        elif overall_score >= 50:
+            grade = "NEEDS_IMPROVEMENT"
+            level = "Junior Ready"
+        else:
+            grade = "POOR"
+            level = "Entry Level"
         
-        "security_analysis": {
-            "security_score": security["security_score"],
-            "risk_level": security["risk_level"],
-            "security_issues": security["security_issues"],
-            "risk_factors": security["risk_factors"]
-        },
-        
-        "ai_feedback": feedback_text,
-        
-        "recommendations": [
-            f"Fix failing tests ({execution['total_tests'] - execution['passed_tests']} failed)" if execution["passed_tests"] < execution["total_tests"] else None,
-            f"Optimize {complexity['time_complexity']} complexity" if complexity["complexity_score"] < 80 else None,
-            "Improve code documentation and style" if style["style_score"] < 80 else None,
-            f"Address {security['risk_level'].lower()} security risks" if security["security_score"] < 80 else None
-        ],
-        
-        "summary": {
-            "strengths": [
-                "Excellent correctness" if execution["correctness_score"] > 90 else None,
-                "Optimal complexity" if complexity["complexity_score"] > 90 else None,
-                "Clean code style" if style["style_score"] > 90 else None,
-                "Secure implementation" if security["security_score"] > 90 else None
-            ],
-            "areas_for_improvement": [
-                "Test coverage" if execution["correctness_score"] < 70 else None,
-                "Algorithm efficiency" if complexity["complexity_score"] < 70 else None,
-                "Code quality" if style["style_score"] < 70 else None,
-                "Security practices" if security["security_score"] < 70 else None
-            ]
+        return {
+            "overall_score": overall_score,
+            "grade": grade,
+            "experience_level": level,
+            "language": submission.language.upper(),
+            "final_verdict": execution_results["final_verdict"],
+            
+            "execution_analysis": {
+                "correctness_score": execution_results["correctness_score"],
+                "passed_tests": execution_results["passed_tests"],
+                "total_tests": execution_results["total_tests"],
+                "performance_summary": execution_results["performance_summary"],
+                "test_results": execution_results["test_results"]
+            },
+            
+            "code_quality_analysis": {
+                "overall_quality_score": quality_metrics["overall_quality_score"],
+                "code_maturity": quality_metrics["code_maturity"],
+                "quality_breakdown": quality_metrics["quality_breakdown"],
+                "improvement_priority": quality_metrics["improvement_priority"]
+            },
+            
+            "industry_readiness_assessment": quality_metrics["industry_readiness"],
+            
+            "detailed_insights": {
+                "algorithm_sophistication": analyze_algorithm_patterns(submission.code, submission.language)["algorithm_sophistication"],
+                "performance_characteristics": analyze_performance_characteristics(submission.code, submission.language),
+                "code_structure_metrics": analyze_code_structure(submission.code, submission.language)
+            },
+            
+            "recommendations": {
+                "immediate_improvements": analyze_performance_characteristics(submission.code, submission.language)["optimization_opportunities"],
+                "career_guidance": quality_metrics["industry_readiness"]["next_milestone"],
+                "skill_development_focus": get_skill_focus(overall_score, quality_metrics)
+            }
         }
-    }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+
+def get_skill_focus(score: int, quality_metrics: Dict) -> List[str]:
+    focus_areas = []
+    
+    if quality_metrics["quality_breakdown"]["readability"] < 60:
+        focus_areas.append("Code readability and documentation")
+    
+    if quality_metrics["quality_breakdown"]["algorithm_design"] < 60:
+        focus_areas.append("Algorithm design and data structures")
+    
+    if quality_metrics["quality_breakdown"]["performance"] < 60:
+        focus_areas.append("Performance optimization and complexity analysis")
+    
+    if score < 70:
+        focus_areas.append("Problem-solving fundamentals")
+    
+    return focus_areas if focus_areas else ["Continue practicing advanced concepts"]
 
 @app.get("/")
 def home():
     return {
-        "message": "🚀 Enhanced Simple Code Judge Ready!",
-        "features": [
-            "Real Code Execution with Test Cases",
-            "Enhanced Complexity Analysis (with recursion detection)",
-            "Comprehensive Style Checking",
-            "Advanced Security Scanning",
-            "AI-Powered Feedback",
-            "Weighted Scoring System",
-            "Async Processing"
+        "message": "🎯 Balanced Coding Judge - Mid to Upper-Intermediate Analysis",
+        "analysis_level": "Balanced (Mid-Level Focus)",
+        "supported_languages": ["Python", "C++", "C", "Java", "JavaScript"],
+        "key_features": [
+            "✅ Balanced complexity analysis (not too basic, not too advanced)",
+            "✅ Code quality and structure assessment",
+            "✅ Industry readiness evaluation",
+            "✅ Performance characteristics analysis",
+            "✅ Algorithm pattern recognition",
+            "✅ Career progression guidance",
+            "✅ Practical improvement suggestions"
         ],
-        "improvements": [
-            "✅ Recursion detection in complexity analysis",
-            "✅ Real code execution with correctness testing",
-            "✅ Enhanced style analysis with more checks",
-            "✅ Better security pattern matching",
-            "✅ Async endpoints for better performance",
-            "✅ Weighted scoring with correctness priority",
-            "✅ Detailed test case results"
+        "grading_system": {
+            "EXCELLENT": "85+ (Senior Ready)",
+            "GOOD": "75-84 (Mid-Level Ready)",
+            "SATISFACTORY": "65-74 (Junior+ Ready)",
+            "NEEDS_IMPROVEMENT": "50-64 (Junior Ready)",
+            "POOR": "<50 (Entry Level)"
+        },
+        "analysis_focus": [
+            "Code structure and readability",
+            "Algorithm design choices",
+            "Performance optimization opportunities",
+            "Industry best practices",
+            "Career development guidance"
         ]
     }
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8007)
+    uvicorn.run(app, host="0.0.0.0", port=7860)
